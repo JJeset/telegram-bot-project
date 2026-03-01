@@ -1,0 +1,17 @@
+# Конфиденциальные файлы
+.env
+cookies.txt
+
+# Временные файлы и кэш
+downloads/
+*.log
+__pycache__/
+*.pyc
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# Архивы
+*.zip
+*.tar.gz
