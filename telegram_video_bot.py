@@ -30,6 +30,84 @@ client = OpenAI(
     api_key=OPENAI_API_KEY,
 )
 
+
+# --- Программный DNS-fallback для обхода заблокированного системного DNS ---
+# Если системный резолвер не может разрешить хост (например, домены YouTube в РФ),
+# используем DNS-over-HTTPS (DoH) через прямое подключение к 1.1.1.1 по IP.
+# Это не зависит от настроек VPN/системного DNS и применяется только тогда,
+# когда обычное разрешение завершается ошибкой (getaddrinfo failed).
+import socket as _socket
+
+
+def _doh_query(hostname, rtype='A'):
+    """Резолв хоста через DNS-over-HTTPS (Cloudflare 1.1.1.1)."""
+    payload = requests.get(
+        'https://1.1.1.1/dns-query',
+        params={'name': hostname, 'type': rtype},
+        headers={'accept': 'application/dns-json'},
+        timeout=10,
+    ).json()
+    return [a['data'] for a in payload.get('Answer', []) if a.get('type') in (1, 28)]
+
+
+def _doh_addrinfo(hostname, port, type=0, proto=0):
+    """Собирает результаты в формате socket.getaddrinfo."""
+    addresses = _doh_query(hostname)
+    wanted_types = [type] if type in (_socket.SOCK_STREAM, _socket.SOCK_DGRAM) \
+        else [_socket.SOCK_STREAM, _socket.SOCK_DGRAM]
+    out = []
+    for addr in addresses:
+        family = _socket.AF_INET6 if ':' in addr else _socket.AF_INET
+        for stype in wanted_types:
+            out.append((family, stype, proto, '', (addr, port)))
+    return out
+
+
+_orig_getaddrinfo = _socket.getaddrinfo
+_orig_gethostbyname = _socket.gethostbyname
+_orig_gethostbyname_ex = _socket.gethostbyname_ex
+
+
+def _safe_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    try:
+        return _orig_getaddrinfo(host, port, family, type, proto, flags)
+    except _socket.gaierror:
+        try:
+            return _doh_addrinfo(host, port, type, proto)
+        except Exception:
+            raise
+
+
+def _safe_gethostbyname(hostname):
+    try:
+        return _orig_gethostbyname(hostname)
+    except _socket.gaierror:
+        try:
+            return _doh_query(hostname)[0]
+        except Exception:
+            raise
+
+
+def _safe_gethostbyname_ex(hostname):
+    try:
+        return _orig_gethostbyname_ex(hostname)
+    except _socket.gaierror:
+        try:
+            addrs = _doh_query(hostname)
+            return (hostname, [], addrs)
+        except Exception:
+            raise
+
+
+def install_dns_fallback():
+    """Устанавливает DoH-fallback для разрешения имён."""
+    _socket.getaddrinfo = _safe_getaddrinfo
+    _socket.gethostbyname = _safe_gethostbyname
+    _socket.gethostbyname_ex = _safe_gethostbyname_ex
+
+
+install_dns_fallback()
+
 class VideoProcessor:
     """Класс для обработки видео"""
     
@@ -108,7 +186,7 @@ def analyze_with_external_api(prompt: str) -> str:
     """Анализирует видео с помощью внешнего API"""
     try:
         response = client.chat.completions.create(
-            model="anthropic/claude-sonnet-4",
+            model="z-ai/glm-5.3-flash",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that analyzes video content and creates summaries."},
                 {"role": "user", "content": prompt}
@@ -136,12 +214,12 @@ def generate_tags_from_content(title: str, content: str) -> str:
 """
         
         response = client.chat.completions.create(
-            model="anthropic/claude-sonnet-4",
+            model="z-ai/glm-5.3-flash",
             messages=[
                 {"role": "system", "content": "You are an assistant that creates relevant tags for content."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=50,
+            max_tokens=100500,
             temperature=0.5,
             timeout=30
         )
@@ -192,7 +270,7 @@ def translate_to_russian(text: str) -> str:
             prompt = f"Переведи следующий текст на русский язык. ВАЖНО: Отвечай ТОЛЬКО переведенным текстом, без дополнительных комментариев:\n\n{text}"
             
             response = client.chat.completions.create(
-                model="anthropic/claude-sonnet-4",
+                model="z-ai/glm-5.3-flash",
                 messages=[
                     {"role": "system", "content": "You are a translator. Translate the following text to Russian."},
                     {"role": "user", "content": prompt}
