@@ -5,8 +5,15 @@ cookies.txt
 # Временные файлы и кэш
 downloads/
 *.log
+logs/
 __pycache__/
 *.pyc
+
+# Управление ботом (start/stop-bot.ps1)
+bot.pid
+
+# База данных заметок (личные данные пользователей бота)
+clipnote.db
 
 # Системные файлы
 .DS_Store
