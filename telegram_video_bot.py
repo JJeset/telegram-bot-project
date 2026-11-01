@@ -6,12 +6,13 @@ from contextlib import closing
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-import yt_dlp
+from video_processor import VideoProcessor, video_error_message
+from note_content import NOTE_RESPONSE_FORMAT, build_note_prompt, parse_note_response
 from pathlib import Path
 import re
 import requests
 import json
-from openai import OpenAI
+from openai import OpenAI, APITimeoutError, APIConnectionError, APIStatusError
 
 # Загрузка переменных окружения из файла .env
 load_dotenv()
@@ -28,9 +29,13 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
 # Конфигурация внешнего API
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+EXTERNAL_API_URL = os.getenv('EXTERNAL_API_URL', 'https://polza.ai/api/v1')
+EXTERNAL_API_MODEL = os.getenv('EXTERNAL_API_MODEL', 'z-ai/glm-5.3-flash')
 client = OpenAI(
-    base_url="https://api.polza.ai/api/v1",
+    base_url=EXTERNAL_API_URL,
     api_key=OPENAI_API_KEY,
+    timeout=60,
+    max_retries=1,
 )
 
 
@@ -271,96 +276,59 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
-class VideoProcessor:
-    """Класс для обработки видео"""
-    
-    def __init__(self):
-        self.download_path = Path('./downloads')
-        self.download_path.mkdir(exist_ok=True)
-    def extract_video_info(self, url: str) -> dict:
-        """Получает информацию о видео и транскрипцию"""
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-            'writesubtitles': True,
-            'writeautomaticsub': True,
-            'subtitleslangs': ['ru'],
-            'skip_download': True,
-            'outtmpl': str(self.download_path / '%(id)s.%(ext)s')
-        }
-        
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                
-                # Получаем субтитры если есть
-                subtitles_text = ""
-                if 'subtitles' in info and info['subtitles']:
-                    for lang in ['ru']:
-                        if lang in info['subtitles']:
-                            subtitles_text = self._extract_subtitle_text(info['subtitles'][lang])
-                            break
-                
-                # Если нет обычных субтитров, пробуем автоматические
-                if not subtitles_text and 'automatic_captions' in info:
-                    for lang in ['ru']:
-                        if lang in info['automatic_captions']:
-                            subtitles_text = self._extract_subtitle_text(info['automatic_captions'][lang])
-                            break
-                
-                return {
-                    'title': info.get('title', 'Без названия'),
-                    'description': info.get('description', ''),
-                    'duration': info.get('duration', 0),
-                    'thumbnail': info.get('thumbnail', ''),
-                    'subtitles': subtitles_text,
-                    'uploader': info.get('uploader', 'Неизвестно'),
-                    'view_count': info.get('view_count', 0),
-                    'tags': info.get('tags', []),
-                }
-        except Exception as e:
-            logger.error(f"Ошибка при извлечении информации: {e}")
-            raise
-    
-    def _extract_subtitle_text(self, subtitle_list: list) -> str:
-        """Извлекает текст из субтитров"""
-        # Выбираем формат с расширением vtt или srv3
-        for sub in subtitle_list:
-            if sub.get('ext') in ['vtt', 'srv3']:
-                url = sub.get('url')
-                if url:
-                    try:
-                        import requests
-                        response = requests.get(url)
-                        if response.status_code == 200:
-                            # Очищаем от тегов VTT
-                            text = re.sub(r'<[^>]+>', '', response.text)
-                            text = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}', '', text)
-                            text = re.sub(r'WEBVTT.*?\n\n', '', text, flags=re.DOTALL)
-                            text = '\n'.join(line.strip() for line in text.split('\n') if line.strip() and not line.strip().isdigit())
-                            return text[:60000]  # Ограничиваем размер
-                    except Exception as e:
-                        logger.error(f"Ошибка при загрузке субтитров: {e}")
-        return ""
-    
+class AnalysisError(Exception):
+    """Ошибка анализа, при которой нельзя создавать заметку."""
 
-def analyze_with_external_api(prompt: str) -> str:
+
+class IncompleteAnalysisError(AnalysisError):
+    """Генерация остановилась до завершения ответа."""
+
+
+def analyze_with_external_api(prompt: str, *, max_tokens: int = 4096) -> str:
     """Анализирует видео с помощью внешнего API"""
     try:
         response = client.chat.completions.create(
-            model="z-ai/glm-5.3-flash",
+            model=EXTERNAL_API_MODEL,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that analyzes video content and creates summaries."},
+                {"role": "system", "content": "Создавай точные заметки по источнику. Выполняй требования к формату ответа. Не добавляй рекламу и не выдумывай факты."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=1000,
+            max_tokens=max_tokens,
+            response_format=NOTE_RESPONSE_FORMAT,
             temperature=0.0
         )
+        if response.choices:
+            finish_reason = getattr(response.choices[0], 'finish_reason', None)
+            logger.info('Ответ AI: finish_reason=%s, max_tokens=%s, символов=%s',
+                        finish_reason, max_tokens, len(response.choices[0].message.content or ''))
+            if finish_reason == 'length':
+                raise IncompleteAnalysisError('Ответ AI оборвался из-за лимита длины.')
+            if finish_reason == 'content_filter':
+                raise AnalysisError('Сервис AI отклонил обработку этого содержимого.')
+        if not response.choices or not response.choices[0].message.content:
+            raise IncompleteAnalysisError('Сервис AI вернул пустой ответ.')
         return response.choices[0].message.content.strip()
+    except APITimeoutError as e:
+        logger.error('Тайм-аут внешнего API (%s): %s', EXTERNAL_API_URL, e)
+        raise AnalysisError('Сервис AI не ответил вовремя. Проверьте адрес EXTERNAL_API_URL и повторите запрос.') from e
+    except APIConnectionError as e:
+        logger.error('Ошибка подключения к внешнему API (%s): %s', EXTERNAL_API_URL, e)
+        raise AnalysisError('Не удалось подключиться к сервису AI. Проверьте интернет и адрес EXTERNAL_API_URL.') from e
+    except APIStatusError as e:
+        logger.error('Внешний API вернул HTTP %s: %s', e.status_code, e)
+        messages = {
+            401: 'Сервис AI отклонил API-ключ. Проверьте OPENAI_API_KEY.',
+            402: 'Сервис AI отклонил запрос из-за оплаты. Проверьте баланс и лимит API-ключа.',
+            403: 'Сервис AI запретил доступ. Проверьте права API-ключа.',
+            404: 'Адрес API или модель не найдены. Проверьте EXTERNAL_API_URL и EXTERNAL_API_MODEL.',
+            429: 'Сервис AI ограничил число запросов. Попробуйте позже.',
+        }
+        raise AnalysisError(messages.get(e.status_code, f'Ошибка сервиса AI (HTTP {e.status_code}). Попробуйте позже.')) from e
+    except AnalysisError:
+        raise
     except Exception as e:
         logger.error(f"Ошибка при обращении к внешнему API: {e}")
-        return "❌ Не удалось проанализировать видео через внешний API."
+        raise AnalysisError('Не удалось проанализировать видео через внешний API. Подробности записаны в журнал.') from e
 
 def generate_tags_from_content(title: str, content: str) -> str:
     """Генерирует 3 тега на основе названия и содержания видео"""
@@ -377,12 +345,12 @@ def generate_tags_from_content(title: str, content: str) -> str:
 """
         
         response = client.chat.completions.create(
-            model="z-ai/glm-5.3-flash",
+            model=EXTERNAL_API_MODEL,
             messages=[
                 {"role": "system", "content": "You are an assistant that creates relevant tags for content."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=100500,
+            max_tokens=128,
             temperature=0.5,
             timeout=30
         )
@@ -433,7 +401,7 @@ def translate_to_russian(text: str) -> str:
             prompt = f"Переведи следующий текст на русский язык. ВАЖНО: Отвечай ТОЛЬКО переведенным текстом, без дополнительных комментариев:\n\n{text}"
             
             response = client.chat.completions.create(
-                model="z-ai/glm-5.3-flash",
+                model=EXTERNAL_API_MODEL,
                 messages=[
                     {"role": "system", "content": "You are a translator. Translate the following text to Russian."},
                     {"role": "user", "content": prompt}
@@ -479,47 +447,16 @@ class AIAnalyzer:
     """Класс для анализа видео через AI"""
     
     @staticmethod
-    def analyze_video(video_info: dict) -> str:
-        """Создает конспект видео"""
-        
-        # Формируем промпт для AI
-        prompt = f"""Create a concise summary based on the provided content.
-Extract only the information that is communicated to the audience.
-Do not mention the format or refer to it as a video.
-Remove any references to the original source being a video.
-Write briefly and strictly to the point.
-Eliminate filler, repetitions, and meta-commentary.
-The result must be a short, structured summary containing only the key information without losing meaning.
-
-Название: {video_info['title']}
-
-
-"""
-
-        if video_info['description']:
-            prompt += f"Описание:\n{video_info['description'][:1000]}\n\n"
-        
-        if video_info['subtitles']:
-            prompt += f"Транскрипция (субтитры):\n{video_info['subtitles']}\n\n"
-        
-        prompt += """
-Create a concise summary based on the provided content.
-Extract only the information that is communicated to the audience.
-Do not mention the format or refer to it as a video.
-Remove any references to the original source being a video.
-Write briefly and strictly to the point.
-Eliminate filler, repetitions, and meta-commentary.
-The result must be a short, structured summary containing only the key information without losing meaning."""
-
-        try:
-            # Получаем анализ от нейросети
-            analysis = analyze_with_external_api(prompt)
-            # Переводим результат на русский язык
-            translated_analysis = translate_to_russian(analysis)
-            return translated_analysis
-        except Exception as e:
-            logger.error(f"Ошибка при обращении к внешнему API: {e}")
-            return "❌ Не удалось проанализировать видео через AI. Попробуйте позже."
+    def analyze_video(video_info: dict) -> dict:
+        """Создаёт название и содержимое заметки одним запросом."""
+        prompt = build_note_prompt(video_info)
+        for max_tokens in (4096, 8192):
+            try:
+                response = analyze_with_external_api(prompt, max_tokens=max_tokens)
+                return parse_note_response(response)
+            except (IncompleteAnalysisError, ValueError, TypeError) as error:
+                logger.warning('Неполный или некорректный ответ AI (лимит %s): %s', max_tokens, error)
+        raise AnalysisError('Сервис AI не смог сформировать заметку после повторного запроса. Попробуйте позже.')
 
 # Инициализируем процессоры
 video_processor = VideoProcessor()
@@ -558,30 +495,12 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         # Анализируем через AI
         await processing_msg.edit_text("🤖 Анализирую контент...")
-        analysis = ai_analyzer.analyze_video(video_info)
-        
-        # Формируем итоговое сообщение с названием видео, отступами и тегами
-        # Используем только название видео в верхнем регистре без тегов
-        # Удаляем возможные теги из названия
-        logger.info(f"Оригинальное название видео: '{video_info['title']}'")
-        logger.info(f"Длина оригинального названия: {len(video_info['title'])}")
-        translated_title = translate_to_russian(video_info['title'])
-        logger.info(f"Название видео после перевода: '{translated_title}'")
-        logger.info(f"Длина названия после перевода: {len(translated_title)}")
-        clean_title = re.sub(r'#\w+', '', translated_title).strip().upper()
-        logger.info(f"Окончательное название видео: '{clean_title}'")
-        
-        # Генерируем 3 тега на основе содержания конспекта
-        tags = generate_tags_from_content(video_info['title'], analysis)
-        
-        result_message = f"""
-[ {clean_title} ]
+        note = ai_analyzer.analyze_video(video_info)
+        clean_title = note['title']
+        analysis = note['content']
+        tags = generate_tags_from_content(clean_title, analysis)
+        result_message = f"{clean_title}\n\n{analysis}\n\n{tags}".strip()
 
-{analysis}
-
-{tags}
-"""
-        
         # Ограничиваем длину сообщения до 4096 символов (лимит Telegram)
         if len(result_message) > 4096:
             result_message = result_message[:4093] + "..."
@@ -593,7 +512,7 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.warning(f"Не удалось удалить сообщение о процессе: {e}")
         
         # Отправляем текстовое сообщение
-        await update.message.reply_text(result_message, parse_mode='HTML')
+        await update.message.reply_text(html.escape(result_message), parse_mode='HTML')
 
         # Заметка ещё не сохранена в базу — ждём, куда пользователь захочет её положить
         context.user_data['pending_note'] = {
@@ -609,18 +528,17 @@ async def process_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     except Exception as e:
         logger.error(f"Ошибка при обработке видео: {e}")
+        error_message = f'❌ {e}' if isinstance(e, AnalysisError) else video_error_message(e)
         # Проверяем, существует ли еще сообщение о процессе перед редактированием
         try:
             await processing_msg.edit_text(
-                f"❌ Произошла ошибка при обработке видео:\n{str(e)}\n\n"
-                "Убедитесь, что ссылка корректна и видео доступно."
+                error_message
             )
         except Exception as edit_error:
             logger.warning(f"Не удалось отредактировать сообщение о процессе: {edit_error}")
             # Если не удалось отредактировать, отправляем новое сообщение
             await update.message.reply_text(
-                f"❌ Произошла ошибка при обработке видео:\n{str(e)}\n\n"
-                "Убедитесь, что ссылка корректна и видео доступно."
+                error_message
             )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -781,14 +699,14 @@ async def notes_browse_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("Заметка не найдена.")
             return
         title, content, tags, _source_url = note
-        text = f"[ {title} ]\n\n{content}\n\n{tags or ''}".strip()
+        text = f"{title}\n\n{content}\n\n{tags or ''}".strip()
         if len(text) > 4096:
             text = text[:4093] + "..."
         edit_buttons = InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ Изменить текст", callback_data=f"ed:text:{note_id}")],
             [InlineKeyboardButton("🏷 Изменить название", callback_data=f"ed:title:{note_id}")],
         ])
-        await query.message.reply_text(text, parse_mode='HTML', reply_markup=edit_buttons)
+        await query.message.reply_text(html.escape(text), parse_mode='HTML', reply_markup=edit_buttons)
         return
 
 

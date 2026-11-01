@@ -8,6 +8,10 @@ $pidFile = Join-Path $scriptDir "bot.pid"
 $logDir  = Join-Path $scriptDir "logs"
 $outLog  = Join-Path $logDir "bot.log"
 $errLog  = Join-Path $logDir "bot.err.log"
+$pythonPath = Join-Path $scriptDir ".venv\Scripts\python.exe"
+if (-not (Test-Path $pythonPath)) {
+    $pythonPath = "python"
+}
 
 if (-not (Test-Path $logDir)) {
     New-Item -ItemType Directory -Path $logDir | Out-Null
@@ -36,7 +40,7 @@ if ($existingPid) {
 }
 
 try {
-    $process = Start-Process -FilePath "python" `
+    $process = Start-Process -FilePath $pythonPath `
         -ArgumentList "telegram_video_bot.py" `
         -WorkingDirectory $scriptDir `
         -RedirectStandardOutput $outLog `

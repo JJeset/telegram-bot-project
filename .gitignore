@@ -8,6 +8,8 @@ downloads/
 logs/
 __pycache__/
 *.pyc
+.test-deps/
+.venv/
 
 # Управление ботом (start/stop-bot.ps1)
 bot.pid

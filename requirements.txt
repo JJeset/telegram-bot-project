@@ -1,5 +1,5 @@
 python-telegram-bot==20.7
-yt-dlp>=2024.1.19
+yt-dlp[default,curl-cffi]>=2026.10.26
 openai>=1.0.0
-requests==2.31.0
+requests>=2.32.2,<3
 python-dotenv==1.0.1
